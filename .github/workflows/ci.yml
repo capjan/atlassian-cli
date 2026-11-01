@@ -1,0 +1,99 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native AOT (${{ matrix.rid }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            rid: osx-arm64
+          - runner: ubuntu-22.04
+            rid: linux-x64
+          - runner: ubuntu-22.04-arm
+            rid: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Native build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang zlib1g-dev
+      - name: Restore
+        run: dotnet restore AtlassianCli.slnx
+      - name: Verify package policy
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, xml.etree.ElementTree as ET
+          for project in pathlib.Path(".").glob("**/*.csproj"):
+              for reference in ET.parse(project).getroot().iter("PackageReference"):
+                  assert reference.attrib["Include"] == "System.CommandLine", reference.attrib
+          allowed = {"System.CommandLine", "Microsoft.DotNet.ILCompiler", "Microsoft.NET.ILLink.Tasks", "atlassian-cli"}
+          for lock in pathlib.Path(".").glob("**/packages.lock.json"):
+              for dependencies in json.loads(lock.read_text())["dependencies"].values():
+                  for package in dependencies:
+                      assert package in allowed or package.startswith("runtime.") and package.endswith(".Microsoft.DotNet.ILCompiler"), package
+          PY
+      - name: Build and test
+        run: dotnet run --project tests/AtlassianCli.Tests -c Release --no-restore
+      - name: Format
+        run: dotnet format AtlassianCli.slnx --verify-no-changes --no-restore
+      - name: Publish native executable
+        run: dotnet publish src/AtlassianCli/AtlassianCli.csproj -c Release -r ${{ matrix.rid }} -o artifacts/${{ matrix.rid }} --no-restore
+      - name: Run the contract suite as Native AOT
+        run: |
+          dotnet publish tests/AtlassianCli.Tests -c Release -r ${{ matrix.rid }} -p:PublishAot=true -o artifacts/native-tests
+          artifacts/native-tests/AtlassianCli.Tests
+      - name: Native smoke tests and dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="artifacts/${{ matrix.rid }}/atlassian-cli"
+          "$binary" version --output json > artifacts/version.json
+          python3 - <<'PY'
+          import json
+          data = json.load(open("artifacts/version.json"))
+          assert data == {"name": "atlassian-cli", "version": "0.1.0"}, data
+          PY
+          "$binary" --help
+          "$binary" confluence comment list --help
+          if "$binary" jira issue delete TEST-1; then
+            echo "Write guard failed" >&2
+            exit 1
+          fi
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            otool -L "$binary" | tee "artifacts/${{ matrix.rid }}/dependencies.txt"
+            if grep -E '/(opt/homebrew|usr/local|Users)/' "artifacts/${{ matrix.rid }}/dependencies.txt"; then
+              echo "Non-system runtime dependency detected" >&2
+              exit 1
+            fi
+          else
+            ldd "$binary" | tee "artifacts/${{ matrix.rid }}/dependencies.txt"
+            if grep 'not found' "artifacts/${{ matrix.rid }}/dependencies.txt"; then
+              exit 1
+            fi
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: atlassian-cli-${{ matrix.rid }}
+          path: |
+            artifacts/${{ matrix.rid }}/atlassian-cli
+            artifacts/${{ matrix.rid }}/dependencies.txt
+          if-no-files-found: error

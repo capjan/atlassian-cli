@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: validate
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Package executables and create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for rid in osx-arm64 linux-x64 linux-arm64; do
+            chmod +x "artifacts/atlassian-cli-$rid/atlassian-cli"
+            cp "artifacts/atlassian-cli-$rid/atlassian-cli" "dist/atlassian-cli-$rid"
+            cp "artifacts/atlassian-cli-$rid/dependencies.txt" "dist/dependencies-$rid.txt"
+            tar -czf "dist/atlassian-cli-$rid.tar.gz" \
+              -C "artifacts/atlassian-cli-$rid" atlassian-cli dependencies.txt \
+              -C "$GITHUB_WORKSPACE" LICENSE THIRD-PARTY-NOTICES DOTNET-THIRD-PARTY-NOTICES.txt README.md docs
+          done
+          cp LICENSE THIRD-PARTY-NOTICES DOTNET-THIRD-PARTY-NOTICES.txt dist/
+          (cd dist && sha256sum atlassian-cli-* dependencies-*.txt LICENSE THIRD-PARTY-NOTICES DOTNET-THIRD-PARTY-NOTICES.txt > checksums.txt)
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

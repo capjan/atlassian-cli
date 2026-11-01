@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/AtlassianCli/AtlassianCli.csproj" />
+  <Project Path="tests/AtlassianCli.Tests/AtlassianCli.Tests.csproj" />
+</Solution>

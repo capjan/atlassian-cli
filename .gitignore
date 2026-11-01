@@ -1,0 +1,8 @@
+**/bin/
+**/obj/
+artifacts/
+.env
+.env.*
+*.user
+*.dSYM/
+.DS_Store

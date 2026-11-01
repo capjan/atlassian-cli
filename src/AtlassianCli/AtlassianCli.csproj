@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>atlassian-cli</AssemblyName>
+    <RootNamespace>AtlassianCli</RootNamespace>
+    <Version>0.1.0</Version>
+    <PublishAot>true</PublishAot>
+    <IsAotCompatible>true</IsAotCompatible>
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+    <IlcTreatWarningsAsErrors>true</IlcTreatWarningsAsErrors>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+    <StripSymbols>true</StripSymbols>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.CommandLine" Version="2.0.14" />
+  </ItemGroup>
+</Project>
