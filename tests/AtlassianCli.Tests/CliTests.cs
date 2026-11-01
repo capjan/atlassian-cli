@@ -2,6 +2,7 @@ using System.Net;
 using System.Text.Json;
 using AtlassianCli.Cli;
 using AtlassianCli.Http;
+using AtlassianCli.Output;
 using AtlassianCli.Serialization;
 using static AtlassianCli.Tests.TestSupport;
 
@@ -17,6 +18,20 @@ internal static class CliTests
             var app = new CliApplication(output, new StringWriter(), clientFactory: (_, _) => throw new InvalidOperationException("Unexpected network client."));
             Equal(0, await app.RunAsync(["--help"]));
             Contains("confluence", output.ToString());
+            output.GetStringBuilder().Clear();
+            Equal(0, await app.RunAsync(["jira", "project", "--help"]));
+            Contains("list", output.ToString());
+            output.GetStringBuilder().Clear();
+            Equal(0, await app.RunAsync(["jira", "sprint", "list", "--help"]));
+            Contains("--project", output.ToString());
+            Contains("--state", output.ToString());
+            Contains("--all", output.ToString());
+            output.GetStringBuilder().Clear();
+            Equal(0, await app.RunAsync(["jira", "sprint", "issues", "--help"]));
+            Contains("--sprint", output.ToString());
+            Contains("--include-body", output.ToString());
+            Contains("--status", output.ToString());
+            Contains("--all", output.ToString());
             output.GetStringBuilder().Clear();
             Equal(0, await app.RunAsync(["version", "-o", "json"]));
             Equal("0.1.0", Parse(output.ToString()).GetProperty("version").GetString());
@@ -214,6 +229,235 @@ internal static class CliTests
             }
         }
         );
+        yield return ("CLI sprint list validates project, state and pagination before HTTP", async () =>
+        {
+            foreach (string[] args in new[]
+            {
+                new[] { "jira", "sprint", "list" },
+                ["jira", "sprint", "list", "--project", ""],
+                ["jira", "sprint", "list", "--project", "DRB\n"],
+                ["jira", "sprint", "list", "--project", "DRB", "--state", ""],
+                ["jira", "sprint", "list", "--project", "DRB", "--state", "active,invalid"],
+                ["jira", "sprint", "list", "--project", "DRB", "--state", "active,"],
+                ["jira", "sprint", "list", "--project", "DRB", "--limit", "0"],
+                ["jira", "sprint", "list", "--project", "DRB", "--start", "-1"]
+            })
+            {
+                var handler = new FakeHandler(_ => throw new InvalidOperationException("Unexpected HTTP request."));
+                using var errors = new StringWriter();
+                var app = new CliApplication(new StringWriter(), errors, clientFactory: (_, _) => Client(handler));
+                Equal(2, await app.RunAsync(args));
+                Equal(0, handler.Requests.Count);
+                True(errors.ToString().Length > 0);
+            }
+        }
+        );
+        yield return ("CLI sprint issues validates required ID and pagination before HTTP", async () =>
+        {
+            foreach (string[] args in new[]
+            {
+                new[] { "jira", "sprint", "issues" },
+                ["jira", "sprint", "issues", "--sprint", "0"],
+                ["jira", "sprint", "issues", "--sprint", "-1"],
+                ["jira", "sprint", "issues", "--sprint", "DRB"],
+                ["jira", "sprint", "issues", "--sprint", "42", "--limit", "0"],
+                ["jira", "sprint", "issues", "--sprint", "42", "--start", "-1"]
+            })
+            {
+                var handler = new FakeHandler(_ => throw new InvalidOperationException("Unexpected HTTP."));
+                using var errors = new StringWriter();
+                var app = new CliApplication(new StringWriter(), errors, clientFactory: (_, _) => Client(handler));
+                Equal(2, await app.RunAsync(args));
+                Equal(0, handler.Requests.Count);
+                True(errors.ToString().Length > 0);
+            }
+        }
+        );
+        yield return ("CLI sprint issues wires ID, pagination and existing issue output formats", async () =>
+        {
+            foreach (OutputFormat format in Enum.GetValues<OutputFormat>())
+            {
+                var handler = new FakeHandler(request =>
+                {
+                    Equal(HttpMethod.Get, request.Method);
+                    Equal("/confluence/rest/agile/1.0/sprint/42/issue", request.Uri.AbsolutePath);
+                    Equal("1", Parameter(request.Uri, "startAt"));
+                    Equal("100", Parameter(request.Uri, "maxResults"));
+                    return Json("{\"startAt\":1,\"total\":2,\"issues\":[{\"key\":\"DRB-7\",\"fields\":{\"summary\":\"Sprint ticket\",\"status\":{\"name\":\"Open\"},\"assignee\":{\"displayName\":\"Alex\"},\"custom\":true}}]}");
+                });
+                using var output = new StringWriter();
+                var app = new CliApplication(output, new StringWriter(), clientFactory: (service, _) =>
+                {
+                    Equal("JIRA", service);
+                    return Client(handler);
+                });
+                Equal(0, await app.RunAsync(["jira", "sprint", "issues", "--sprint", "42", "--start", "1", "--limit", "1", "--all", "-o", format.ToString()]));
+                Contains("DRB-7", output.ToString());
+                Contains("Sprint ticket", output.ToString());
+                Contains("Open", output.ToString());
+                Contains("Alex", output.ToString());
+                if (format == OutputFormat.Json)
+                {
+                    JsonElement result = Parse(output.ToString());
+                    Equal(1, result.GetProperty("size").GetInt32());
+                    Equal(1, result.GetProperty("start").GetInt32());
+                    Equal(1, result.GetProperty("limit").GetInt32());
+                    True(!result.GetProperty("hasMore").GetBoolean());
+                    True(result.GetProperty("results")[0].GetProperty("fields").GetProperty("custom").GetBoolean());
+                }
+            }
+        }
+        );
+        yield return ("CLI sprint issues reports API errors without partial results", async () =>
+        {
+            foreach (HttpStatusCode status in new[] { HttpStatusCode.Forbidden, HttpStatusCode.NotFound })
+            {
+                var handler = new FakeHandler(_ => Json("{\"message\":\"Sprint unavailable\"}", status));
+                using var output = new StringWriter();
+                using var errors = new StringWriter();
+                var app = new CliApplication(output, errors, clientFactory: (_, _) => Client(handler));
+                Equal(status == HttpStatusCode.Forbidden ? 3 : 5,
+                    await app.RunAsync(["jira", "sprint", "issues", "--sprint", "42"]));
+                Equal("", output.ToString());
+                Contains("Sprint unavailable", errors.ToString());
+            }
+        }
+        );
+        yield return ("CLI sprint issue descriptions are opt-in for retrieval and human output", async () =>
+        {
+            foreach (bool includeBody in new[] { false, true })
+            {
+                foreach (OutputFormat format in Enum.GetValues<OutputFormat>())
+                {
+                    var handler = new FakeHandler(request =>
+                    {
+                        Equal(includeBody ? "*all" : "summary,status,assignee", Parameter(request.Uri, "fields"));
+                        string description = includeBody ? ",\"description\":\"Detailed content\",\"custom\":true" : "";
+                        return Json($"{{\"startAt\":0,\"total\":1,\"issues\":[{{\"key\":\"DRB-7\",\"fields\":{{\"summary\":\"Overview\",\"status\":{{\"name\":\"Open\"}},\"assignee\":{{\"displayName\":\"Alex\"}}{description}}}}}]}}");
+                    });
+                    using var output = new StringWriter();
+                    var app = new CliApplication(output, new StringWriter(), clientFactory: (_, _) => Client(handler));
+                    string[] args = ["jira", "sprint", "issues", "--sprint", "42", "-o", format.ToString()];
+                    Equal(0, await app.RunAsync(includeBody ? [.. args, "--include-body"] : args));
+                    Contains("Overview", output.ToString());
+                    Equal(includeBody, output.ToString().Contains("Detailed content", StringComparison.Ordinal));
+                    if (format == OutputFormat.Json)
+                    {
+                        JsonElement fields = Parse(output.ToString()).GetProperty("results")[0].GetProperty("fields");
+                        Equal(includeBody, fields.TryGetProperty("description", out _));
+                        Equal(includeBody, fields.TryGetProperty("custom", out _));
+                    }
+                    else
+                    {
+                        Equal(includeBody, output.ToString().Contains("### Content:", StringComparison.Ordinal));
+                    }
+                }
+            }
+        }
+        );
+        yield return ("CLI sprint status filters combine with pagination and include-body", async () =>
+        {
+            var handler = new FakeHandler(request =>
+            {
+                Equal("status IN (\"Open\", \"In Progress\") AND status NOT IN (\"Done\")", Parameter(request.Uri, "jql"));
+                Equal("*all", Parameter(request.Uri, "fields"));
+                Equal("1", Parameter(request.Uri, "startAt"));
+                Equal("1", Parameter(request.Uri, "maxResults"));
+                return Json("{\"startAt\":1,\"total\":3,\"issues\":[{\"key\":\"DRB-7\",\"fields\":{\"summary\":\"Filtered\",\"description\":\"Details\"}}]}");
+            });
+            using var output = new StringWriter();
+            var app = new CliApplication(output, new StringWriter(), clientFactory: (_, _) => Client(handler));
+            Equal(0, await app.RunAsync(["jira", "sprint", "issues", "--sprint", "42",
+                "--status", "Open,+In Progress", "--status=-Done",
+                "--include-body", "--start", "1", "--limit", "1", "-o", "json"]));
+            JsonElement result = Parse(output.ToString());
+            Equal(1, result.GetProperty("size").GetInt32());
+            Equal(3, result.GetProperty("total").GetInt32());
+            True(result.GetProperty("hasMore").GetBoolean());
+            Contains("Details", output.ToString());
+        }
+        );
+        yield return ("CLI invalid sprint status filters produce explicit input errors", async () =>
+        {
+            foreach (string[] options in new[]
+            {
+                new[] { "--status" }, ["--status", "+"],
+                ["--status="], ["--status=-"], ["--status", "+Open", "--status=-open"],
+                ["--status=Ready,"], ["--status=Ready,,Done"]
+            })
+            {
+                var handler = new FakeHandler(_ => throw new InvalidOperationException("Unexpected HTTP."));
+                using var errors = new StringWriter();
+                var app = new CliApplication(new StringWriter(), errors, clientFactory: (_, _) => Client(handler));
+                Equal(2, await app.RunAsync(["jira", "sprint", "issues", "--sprint", "42", .. options]));
+                Equal(0, handler.Requests.Count);
+                True(errors.ToString().Length > 0);
+            }
+        }
+        );
+        yield return ("CLI accepts comma-separated signed and unsigned sprint statuses", async () =>
+        {
+            foreach (string statuses in new[] { "-Done,+Ready,+ReadyForTest", "-Done,Ready,ReadyForTest" })
+            {
+                var handler = new FakeHandler(request =>
+                {
+                    Equal("status IN (\"Ready\", \"ReadyForTest\") AND status NOT IN (\"Done\")", Parameter(request.Uri, "jql"));
+                    return Json("{\"startAt\":0,\"total\":0,\"issues\":[]}");
+                });
+                var app = new CliApplication(new StringWriter(), new StringWriter(), clientFactory: (_, _) => Client(handler));
+                Equal(0, await app.RunAsync(["jira", "sprint", "issues", "--sprint", "42", "--status=" + statuses]));
+                Equal(1, handler.Requests.Count);
+            }
+        }
+        );
+        yield return ("CLI sprint list wires project, state, combined pagination and JSON output", async () =>
+        {
+            var handler = new FakeHandler(request =>
+            {
+                Equal(HttpMethod.Get, request.Method);
+                if (request.Uri.AbsolutePath == "/confluence/rest/agile/1.0/board")
+                {
+                    Equal("DRB", Parameter(request.Uri, "projectKeyOrId"));
+                    Equal("scrum", Parameter(request.Uri, "type"));
+                    return Json("{\"startAt\":0,\"isLast\":true,\"values\":[{\"id\":7}]}");
+                }
+
+                Equal("/confluence/rest/agile/1.0/board/7/sprint", request.Uri.AbsolutePath);
+                Equal("active,future", Parameter(request.Uri, "state"));
+                return Json("{\"startAt\":0,\"isLast\":true,\"values\":[{\"id\":12,\"name\":\"Twelve\",\"goal\":\"original\"},{\"id\":2,\"name\":\"Two\",\"goal\":\"second\"}]}");
+            });
+            using var output = new StringWriter();
+            var app = new CliApplication(output, new StringWriter(), clientFactory: (service, _) =>
+            {
+                Equal("JIRA", service);
+                return Client(handler);
+            });
+            Equal(0, await app.RunAsync(["jira", "sprint", "list", "--project", "DRB", "--state", "active,future", "--start", "1", "--limit", "1", "-o", "json"]));
+            JsonElement result = Parse(output.ToString());
+            Equal(1, result.GetProperty("start").GetInt32());
+            Equal(1, result.GetProperty("size").GetInt32());
+            Equal(1, result.GetProperty("limit").GetInt32());
+            Equal(2, result.GetProperty("total").GetInt32());
+            True(!result.GetProperty("hasMore").GetBoolean());
+            Equal(2, result.GetProperty("results")[0].GetProperty("id").GetInt32());
+            Equal("second", JsonValues.Text(result.GetProperty("results")[0], "goal"));
+            Equal(2, handler.Requests.Count);
+        }
+        );
+        yield return ("CLI sprint API failure reports error without partial output", async () =>
+        {
+            var handler = new FakeHandler(request =>
+                request.Uri.AbsolutePath.EndsWith("/board", StringComparison.Ordinal)
+                    ? Json("{\"startAt\":0,\"isLast\":true,\"values\":[{\"id\":1}]}")
+                    : Json("{\"message\":\"Forbidden\"}", HttpStatusCode.Forbidden));
+            using var output = new StringWriter();
+            using var errors = new StringWriter();
+            var app = new CliApplication(output, errors, clientFactory: (_, _) => Client(handler));
+            Equal(3, await app.RunAsync(["jira", "sprint", "list", "--project", "DRB"]));
+            Equal("", output.ToString());
+            Contains("403", errors.ToString());
+        }
+        );
     }
 
     private static IEnumerable<string[]> MutationCommands()
@@ -232,6 +476,7 @@ internal static class CliTests
     private static IEnumerable<(string[], string, HttpMethod)> Contracts()
     {
         yield return (["jira", "myself"], "/rest/api/2/myself", HttpMethod.Get);
+        yield return (["jira", "project", "list"], "/rest/api/2/project", HttpMethod.Get);
         yield return (["jira", "issue", "get", "TEST-1"], "/rest/api/2/issue/TEST-1", HttpMethod.Get);
         yield return (["jira", "issue", "search", "project = TEST"], "/rest/api/2/search", HttpMethod.Get);
         yield return (["jira", "issue", "create", "--project", "TEST", "--summary", "Title", "--assignee", "alice", "--allow-write"], "/rest/api/2/issue", HttpMethod.Post);
@@ -268,6 +513,11 @@ internal static class CliTests
         string path = request.Uri.AbsolutePath;
         if (path.Contains("/rest/api/2/", StringComparison.Ordinal))
         {
+            if (path.EndsWith("/project", StringComparison.Ordinal))
+            {
+                return Json("[]");
+            }
+
             if (path.EndsWith("/search", StringComparison.Ordinal))
             {
                 return Json("{\"startAt\":0,\"total\":0,\"issues\":[]}");

@@ -15,11 +15,189 @@ public sealed class JiraClient(AtlassianHttpClient http)
     public Task<JsonElement> GetIssueAsync(string key, CancellationToken cancellationToken)
         => http.GetAsync(IssuePath(key), null, cancellationToken);
 
+    public async Task<ListResult> ProjectsAsync(PageRequest page, CancellationToken cancellationToken)
+    {
+        page.Validate();
+        JsonElement response = await http.GetArrayAsync("/rest/api/2/project", cancellationToken);
+        JsonElement[] projects = response.EnumerateArray().Select(project => project.Clone()).ToArray();
+        if (projects.Any(project => project.ValueKind != JsonValueKind.Object))
+        {
+            throw new InvalidDataException("Jira project list contains a non-object item.");
+        }
+
+        JsonElement[] results = projects.Skip(page.Start).Take(page.All ? int.MaxValue : page.Limit).ToArray();
+        bool hasMore = (long)page.Start + results.Length < projects.Length;
+        return new ListResult(results, page.Start, page.Limit, results.Length, projects.Length, hasMore);
+    }
+
     public Task<ListResult> SearchAsync(string jql, PageRequest page, CancellationToken cancellationToken)
         => CollectAsync("/rest/api/2/search", "issues", [new("jql", jql)], page, cancellationToken);
 
     public Task<ListResult> CommentsAsync(string key, PageRequest page, CancellationToken cancellationToken)
         => CollectAsync(IssuePath(key) + "/comment", "comments", [], page, cancellationToken);
+
+    public Task<ListResult> SprintIssuesAsync(
+        int sprintId, PageRequest page, CancellationToken cancellationToken,
+        bool includeBody = false, string[]? statuses = null)
+    {
+        if (sprintId <= 0)
+        {
+            throw new ArgumentException("--sprint must be a positive numeric sprint ID.");
+        }
+
+        string jql = StatusJql(statuses ?? []);
+        KeyValuePair<string, string>[] query = [new("fields", includeBody ? "*all" : "summary,status,assignee")];
+        if (jql.Length > 0)
+        {
+            query = [.. query, new("jql", jql)];
+        }
+
+        return CollectAsync("/rest/agile/1.0/sprint/" + JsonValues.Number(sprintId) + "/issue",
+            "issues", query, page, cancellationToken);
+    }
+
+    private static string StatusJql(string[] statuses)
+    {
+        var included = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (string value in statuses)
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.Any(char.IsControl))
+            {
+                throw new ArgumentException("--status requires non-empty status names without control characters.");
+            }
+
+            foreach (string entry in value.Split(','))
+            {
+                string status = entry.Trim();
+                bool exclude = status.StartsWith("-", StringComparison.Ordinal);
+                string name = status.StartsWith("+", StringComparison.Ordinal) || exclude ? status[1..].Trim() : status;
+                if (name.Length == 0)
+                {
+                    throw new ArgumentException("--status cannot contain empty entries or a sign without a name.");
+                }
+
+                (exclude ? excluded : included).Add(name);
+            }
+        }
+
+        if (included.Overlaps(excluded))
+        {
+            throw new ArgumentException("A status cannot be both included and excluded.");
+        }
+
+        string Quote(string name) => "\"" + name.Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
+        var clauses = new List<string>();
+        if (included.Count > 0)
+        {
+            clauses.Add("status IN (" + string.Join(", ", included.Select(Quote)) + ")");
+        }
+
+        if (excluded.Count > 0)
+        {
+            clauses.Add("status NOT IN (" + string.Join(", ", excluded.Select(Quote)) + ")");
+        }
+
+        return string.Join(" AND ", clauses);
+    }
+
+    public async Task<ListResult> SprintsAsync(string project, string? state, PageRequest page, CancellationToken cancellationToken)
+    {
+        page.Validate();
+        ArgumentException.ThrowIfNullOrWhiteSpace(project);
+        if (project.Any(char.IsControl))
+        {
+            throw new ArgumentException("--project cannot contain control characters.");
+        }
+
+        if (state is not null && state.Split(',').Any(value => value is not ("active" or "future" or "closed")))
+        {
+            throw new ArgumentException("--state must contain active, future or closed, separated by commas.");
+        }
+
+        JsonElement[] boards = await CollectAgileAsync("/rest/agile/1.0/board",
+            [new("projectKeyOrId", project), new("type", "scrum")], cancellationToken);
+        var boardIds = new HashSet<int>();
+        var sprints = new SortedDictionary<int, JsonElement>();
+        foreach (JsonElement board in boards)
+        {
+            int boardId = AgileId(board);
+            if (!boardIds.Add(boardId))
+            {
+                continue;
+            }
+
+            JsonElement[] boardSprints = await CollectAgileAsync(
+                "/rest/agile/1.0/board/" + JsonValues.Number(boardId) + "/sprint",
+                state is null ? [] : [new("state", state)], cancellationToken);
+            foreach (JsonElement sprint in boardSprints)
+            {
+                sprints.TryAdd(AgileId(sprint), sprint);
+            }
+        }
+
+        JsonElement[] results = sprints.Values.Reverse().Skip(page.Start).Take(page.All ? int.MaxValue : page.Limit).ToArray();
+        return new ListResult(results, page.Start, page.Limit, results.Length, sprints.Count,
+            (long)page.Start + results.Length < sprints.Count);
+    }
+
+    private static int AgileId(JsonElement value)
+    {
+        int id = JsonValues.RequiredInt(value, "id");
+        return id > 0 ? id : throw new InvalidDataException("Jira Agile returned a non-positive board or sprint ID.");
+    }
+
+    private async Task<JsonElement[]> CollectAgileAsync(
+        string path,
+        KeyValuePair<string, string>[] query,
+        CancellationToken cancellationToken)
+    {
+        var results = new List<JsonElement>();
+        int next = 0;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            JsonElement response = await http.GetAsync(path,
+                [.. query, new("startAt", JsonValues.Number(next)), new("maxResults", "100")], cancellationToken);
+            JsonElement[] items = JsonValues.RequiredArray(response, "values");
+            int actualStart = JsonValues.RequiredInt(response, "startAt");
+            int? total = response.TryGetProperty("total", out _) ? JsonValues.RequiredInt(response, "total") : null;
+            bool isLast;
+            if (response.TryGetProperty("isLast", out JsonElement last))
+            {
+                if (last.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                {
+                    throw new InvalidDataException("Jira Agile returned invalid isLast pagination metadata.");
+                }
+
+                isLast = last.GetBoolean();
+            }
+            else if (total is int count)
+            {
+                isLast = (long)actualStart + items.Length >= count;
+            }
+            else
+            {
+                throw new InvalidDataException("Jira Agile list response is missing isLast or total pagination metadata.");
+            }
+
+            long end = (long)actualStart + items.Length;
+            if (actualStart != next || items.Length > 100 || (!isLast && items.Length == 0)
+                || end > int.MaxValue || (total is int size && (end > size || isLast != (end >= size))))
+            {
+                throw new InvalidDataException("Jira Agile returned inconsistent pagination metadata; refusing a potentially incomplete result.");
+            }
+
+            results.AddRange(items);
+            if (isLast)
+            {
+                return results.ToArray();
+            }
+
+            next = (int)end;
+        }
+    }
 
     private async Task<ListResult> CollectAsync(
         string path,

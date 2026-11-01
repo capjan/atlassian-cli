@@ -13,6 +13,316 @@ internal static class ClientTests
 {
     public static IEnumerable<(string, Func<Task>)> Cases()
     {
+        yield return ("Sprint status inclusion and exclusion build safe JQL on every page", async () =>
+        {
+            foreach ((string[] statuses, string jql) in new (string[], string)[]
+            {
+                (["+Open", "+In Progress", "+open"], "status IN (\"Open\", \"In Progress\")"),
+                (["Open", "In Progress"], "status IN (\"Open\", \"In Progress\")"),
+                (["-Done,+Ready,+ReadyForTest"], "status IN (\"Ready\", \"ReadyForTest\") AND status NOT IN (\"Done\")"),
+                ([" -Done , Ready , +ReadyForTest ", "ready"], "status IN (\"Ready\", \"ReadyForTest\") AND status NOT IN (\"Done\")"),
+                (["-Done", "-Cancelled"], "status NOT IN (\"Done\", \"Cancelled\")"),
+                (["+ In Progress ", "-Done"], "status IN (\"In Progress\") AND status NOT IN (\"Done\")"),
+                (["+A\" OR status != \"B", "-C\\D", "+A,B"], "status IN (\"A\\\" OR status != \\\"B\", \"A\", \"B\") AND status NOT IN (\"C\\\\D\")")
+            })
+            {
+                var handler = new FakeHandler(request =>
+                {
+                    Equal(jql, Parameter(request.Uri, "jql"));
+                    Equal("*all", Parameter(request.Uri, "fields"));
+                    int start = int.Parse(Parameter(request.Uri, "startAt"), System.Globalization.CultureInfo.InvariantCulture);
+                    return Json($"{{\"startAt\":{start},\"total\":2,\"issues\":[{{\"key\":\"DRB-{start}\"}}]}}");
+                });
+                using AtlassianHttpClient http = Client(handler);
+                ListResult result = await new JiraClient(http).SprintIssuesAsync(42, new PageRequest(All: true), default, true, statuses);
+                Equal(2, result.Size);
+                Equal(2L, result.Total);
+                True(!result.HasMore);
+                Equal(2, handler.Requests.Count);
+            }
+        }
+        );
+        yield return ("Sprint status malformed and conflicting filters fail before HTTP", async () =>
+        {
+            var handler = new FakeHandler(_ => throw new InvalidOperationException("Unexpected HTTP."));
+            using AtlassianHttpClient http = Client(handler);
+            foreach (string[] statuses in new[]
+            {
+                new[] { "" }, ["+"], ["-  "], ["+Open\n"], ["+Open", "-open"],
+                ["+ Open ", "-OPEN"], ["Ready,"], [",Ready"], ["Ready,,Done"], ["Ready,-ready"]
+            })
+            {
+                await ThrowsAsync<ArgumentException>(() => new JiraClient(http).SprintIssuesAsync(42, new PageRequest(), default, statuses: statuses));
+            }
+
+            Equal(0, handler.Requests.Count);
+        }
+        );
+        yield return ("Sprint issues preserve original fields, server order and pagination limits", async () =>
+        {
+            var handler = new FakeHandler(request =>
+            {
+                Equal(HttpMethod.Get, request.Method);
+                Equal("/confluence/rest/agile/1.0/sprint/42/issue", request.Uri.AbsolutePath);
+                Equal("", Parameter(request.Uri, "jql"));
+                Equal("summary,status,assignee", Parameter(request.Uri, "fields"));
+                int start = int.Parse(Parameter(request.Uri, "startAt"), System.Globalization.CultureInfo.InvariantCulture);
+                int requested = int.Parse(Parameter(request.Uri, "maxResults"), System.Globalization.CultureInfo.InvariantCulture);
+                int count = Math.Min(2, Math.Min(requested, Math.Max(0, 5 - start)));
+                string issues = string.Join(",", Enumerable.Range(start, count)
+                    .Select(id => $"{{\"key\":\"DRB-{5 - id}\",\"fields\":{{\"summary\":\"Ticket\",\"custom\":true}}}}"));
+                return Json($"{{\"startAt\":{start},\"total\":5,\"issues\":[{issues}]}}");
+            });
+            using AtlassianHttpClient http = Client(handler);
+            var client = new JiraClient(http);
+            ListResult result = await client.SprintIssuesAsync(42, new PageRequest(Start: 1, Limit: 3), default);
+            Equal(1, result.Start);
+            Equal(3, result.Size);
+            Equal(5L, result.Total);
+            True(result.HasMore);
+            Equal("DRB-4", JsonValues.Text(result.Results[0], "key"));
+            Equal("DRB-2", JsonValues.Text(result.Results[2], "key"));
+            True(result.Results[0].GetProperty("fields").GetProperty("custom").GetBoolean());
+            Equal(2, handler.Requests.Count);
+            Equal("3", Parameter(handler.Requests[0].Uri, "maxResults"));
+            Equal("1", Parameter(handler.Requests[1].Uri, "maxResults"));
+            result = await client.SprintIssuesAsync(42, new PageRequest(All: true), default);
+            Equal(5, result.Size);
+            True(!result.HasMore);
+            Equal("DRB-1", JsonValues.Text(result.Results[4], "key"));
+        }
+        );
+        yield return ("Sprint issues handle empty lists and reject invalid pagination responses", async () =>
+        {
+            using AtlassianHttpClient empty = Client(new FakeHandler(_ => Json("{\"startAt\":0,\"total\":0,\"issues\":[]}")));
+            ListResult result = await new JiraClient(empty).SprintIssuesAsync(42, new PageRequest(), default);
+            Equal(0, result.Size);
+            Equal(0L, result.Total);
+            True(!result.HasMore);
+            foreach (string response in new[]
+            {
+                "{\"startAt\":0,\"total\":5,\"issues\":[]}",
+                "{\"startAt\":1,\"total\":1,\"issues\":[{}]}",
+                "{\"startAt\":0,\"issues\":[]}"
+            })
+            {
+                using AtlassianHttpClient http = Client(new FakeHandler(_ => Json(response)));
+                await ThrowsAsync<InvalidDataException>(() => new JiraClient(http).SprintIssuesAsync(42, new PageRequest(), default));
+            }
+        }
+        );
+        yield return ("Sprint issues request all fields on every page only with include-body", async () =>
+        {
+            var handler = new FakeHandler(request =>
+            {
+                Equal("*all", Parameter(request.Uri, "fields"));
+                int start = int.Parse(Parameter(request.Uri, "startAt"), System.Globalization.CultureInfo.InvariantCulture);
+                return Json($"{{\"startAt\":{start},\"total\":2,\"issues\":[{{\"key\":\"DRB-{start}\",\"fields\":{{\"description\":\"Details\",\"custom\":true}}}}]}}");
+            });
+            using AtlassianHttpClient http = Client(handler);
+            ListResult result = await new JiraClient(http).SprintIssuesAsync(42, new PageRequest(All: true), default, includeBody: true);
+            Equal(2, handler.Requests.Count);
+            Equal("Details", JsonValues.Text(result.Results[1], "fields", "description"));
+            True(result.Results[1].GetProperty("fields").GetProperty("custom").GetBoolean());
+        }
+        );
+        yield return ("Sprint issues reject invalid IDs before HTTP", async () =>
+        {
+            var handler = new FakeHandler(_ => throw new InvalidOperationException("Unexpected HTTP."));
+            using AtlassianHttpClient http = Client(handler);
+            foreach (int id in new[] { 0, -1 })
+            {
+                await ThrowsAsync<ArgumentException>(() => new JiraClient(http).SprintIssuesAsync(id, new PageRequest(), default));
+            }
+
+            Equal(0, handler.Requests.Count);
+        }
+        );
+        yield return ("Jira sprints paginate all boards, deduplicate and order by descending numeric ID", async () =>
+        {
+            var handler = new FakeHandler(request =>
+            {
+                Equal(HttpMethod.Get, request.Method);
+                Equal("100", Parameter(request.Uri, "maxResults"));
+                int start = int.Parse(Parameter(request.Uri, "startAt"), System.Globalization.CultureInfo.InvariantCulture);
+                if (request.Uri.AbsolutePath.EndsWith("/board", StringComparison.Ordinal))
+                {
+                    Equal("DRB", Parameter(request.Uri, "projectKeyOrId"));
+                    Equal("scrum", Parameter(request.Uri, "type"));
+                    return start == 0
+                        ? Json("{\"startAt\":0,\"isLast\":false,\"values\":[{\"id\":1}]}")
+                        : Json("{\"startAt\":1,\"isLast\":true,\"values\":[{\"id\":2},{\"id\":1}]}");
+                }
+
+                Equal("", Parameter(request.Uri, "state"));
+                if (request.Uri.AbsolutePath.EndsWith("/board/1/sprint", StringComparison.Ordinal))
+                {
+                    return start == 0
+                        ? Json("{\"startAt\":0,\"isLast\":false,\"values\":[{\"id\":10,\"name\":\"Ten\",\"goal\":\"kept\"}]}")
+                        : Json("{\"startAt\":1,\"isLast\":true,\"values\":[{\"id\":2,\"name\":\"Two\"}]}");
+                }
+
+                Equal("/confluence/rest/agile/1.0/board/2/sprint", request.Uri.AbsolutePath);
+                Equal(0, start);
+                return Json("{\"startAt\":0,\"total\":2,\"values\":[{\"id\":10,\"name\":\"Ten\"},{\"id\":3,\"name\":\"Three\"}]}");
+            });
+            using AtlassianHttpClient http = Client(handler);
+            var client = new JiraClient(http);
+            ListResult result = await client.SprintsAsync("DRB", null, new PageRequest(All: true), default);
+            Equal(3, result.Size);
+            Equal(3L, result.Total);
+            Equal("10", JsonValues.Text(result.Results[0], "id"));
+            Equal("3", JsonValues.Text(result.Results[1], "id"));
+            Equal("2", JsonValues.Text(result.Results[2], "id"));
+            Equal("kept", JsonValues.Text(result.Results[0], "goal"));
+            True(!result.HasMore);
+            Equal(5, handler.Requests.Count);
+
+            result = await client.SprintsAsync("DRB", null, new PageRequest(Limit: 1), default);
+            Equal(1, result.Size);
+            Equal("10", JsonValues.Text(result.Results[0], "id"));
+            True(result.HasMore);
+
+            result = await client.SprintsAsync("DRB", null, new PageRequest(Start: 1, Limit: 1), default);
+            Equal(1, result.Start);
+            Equal(1, result.Limit);
+            Equal(1, result.Size);
+            Equal("3", JsonValues.Text(result.Results[0], "id"));
+            Equal(3L, result.Total);
+            True(result.HasMore);
+
+            result = await client.SprintsAsync("DRB", null, new PageRequest(Start: 1, Limit: 1, All: true), default);
+            Equal(2, result.Size);
+            Equal("3", JsonValues.Text(result.Results[0], "id"));
+            Equal("2", JsonValues.Text(result.Results[1], "id"));
+            True(!result.HasMore);
+            result = await client.SprintsAsync("DRB", null, new PageRequest(Start: 4), default);
+            Equal(0, result.Size);
+            Equal(3L, result.Total);
+            True(!result.HasMore);
+        }
+        );
+        yield return ("Jira sprint state filters are forwarded on every sprint page", async () =>
+        {
+            foreach (string state in new[] { "active", "future", "closed", "active,future" })
+            {
+                var handler = new FakeHandler(request =>
+                {
+                    if (request.Uri.AbsolutePath.EndsWith("/board", StringComparison.Ordinal))
+                    {
+                        return Json("{\"startAt\":0,\"isLast\":true,\"values\":[{\"id\":1}]}");
+                    }
+
+                    Equal(state, Parameter(request.Uri, "state"));
+                    return Parameter(request.Uri, "startAt") == "0"
+                        ? Json("{\"startAt\":0,\"isLast\":false,\"values\":[{\"id\":1}]}")
+                        : Json("{\"startAt\":1,\"isLast\":true,\"values\":[{\"id\":2}]}");
+                });
+                using AtlassianHttpClient http = Client(handler);
+                ListResult result = await new JiraClient(http).SprintsAsync("DRB", state, new PageRequest(), default);
+                Equal(2, result.Size);
+                Equal(3, handler.Requests.Count);
+            }
+        }
+        );
+        yield return ("Jira sprint empty boards and empty sprint lists return an explicit empty list", async () =>
+        {
+            foreach (bool hasBoard in new[] { false, true })
+            {
+                var handler = new FakeHandler(request => hasBoard && request.Uri.AbsolutePath.EndsWith("/board", StringComparison.Ordinal)
+                    ? Json("{\"startAt\":0,\"isLast\":true,\"values\":[{\"id\":1}]}")
+                    : Json("{\"startAt\":0,\"isLast\":true,\"values\":[]}"));
+                using AtlassianHttpClient http = Client(handler);
+                ListResult result = await new JiraClient(http).SprintsAsync("DRB", null, new PageRequest(), default);
+                Equal(0, result.Size);
+                Equal(0L, result.Total);
+                True(!result.HasMore);
+                Equal(hasBoard ? 2 : 1, handler.Requests.Count);
+            }
+        }
+        );
+        yield return ("Jira Agile rejects malformed pagination and identities on boards and sprints", async () =>
+        {
+            foreach (string response in new[]
+            {
+                "{\"startAt\":0,\"values\":[]}",
+                "{\"startAt\":0,\"isLast\":\"true\",\"values\":[]}",
+                "{\"startAt\":0,\"isLast\":false,\"values\":[]}",
+                "{\"startAt\":1,\"isLast\":true,\"values\":[{\"id\":1}]}",
+                "{\"startAt\":0,\"isLast\":true,\"total\":2,\"values\":[{\"id\":1}]}",
+                "{\"startAt\":0,\"isLast\":false,\"total\":1,\"values\":[{\"id\":1}]}",
+                "{\"startAt\":0,\"isLast\":true,\"total\":-1,\"values\":[]}",
+                "{\"startAt\":0,\"isLast\":true,\"values\":[{}]}",
+                "{\"startAt\":0,\"isLast\":true,\"values\":[{\"id\":0}]}",
+                "{\"startAt\":0,\"isLast\":true,\"values\":[null]}"
+            })
+            {
+                foreach (bool failOnBoard in new[] { false, true })
+                {
+                    var handler = new FakeHandler(request =>
+                        !failOnBoard && request.Uri.AbsolutePath.EndsWith("/board", StringComparison.Ordinal)
+                            ? Json("{\"startAt\":0,\"isLast\":true,\"values\":[{\"id\":1}]}")
+                            : Json(response));
+                    using AtlassianHttpClient http = Client(handler);
+                    await ThrowsAsync<InvalidDataException>(() => new JiraClient(http).SprintsAsync("DRB", null, new PageRequest(), default));
+                }
+            }
+        }
+        );
+        yield return ("Jira Agile rejects repeating offsets and oversized pages", async () =>
+        {
+            foreach (bool repeatOffset in new[] { false, true })
+            {
+                string values = string.Join(",", Enumerable.Range(1, 101).Select(id => $"{{\"id\":{id}}}"));
+                var handler = new FakeHandler(_ => repeatOffset
+                    ? Json("{\"startAt\":0,\"isLast\":false,\"values\":[{\"id\":1}]}")
+                    : Json($"{{\"startAt\":0,\"isLast\":true,\"values\":[{values}]}}"));
+                using AtlassianHttpClient http = Client(handler);
+                await ThrowsAsync<InvalidDataException>(() => new JiraClient(http).SprintsAsync("DRB", null, new PageRequest(), default));
+                Equal(repeatOffset ? 2 : 1, handler.Requests.Count);
+            }
+        }
+        );
+        yield return ("Jira sprint API failures do not return partial results", async () =>
+        {
+            var handler = new FakeHandler(request =>
+            {
+                if (request.Uri.AbsolutePath.EndsWith("/board", StringComparison.Ordinal))
+                {
+                    return Json("{\"startAt\":0,\"isLast\":true,\"values\":[{\"id\":1},{\"id\":2}]}");
+                }
+
+                return request.Uri.AbsolutePath.EndsWith("/board/1/sprint", StringComparison.Ordinal)
+                    ? Json("{\"startAt\":0,\"isLast\":true,\"values\":[{\"id\":10}]}")
+                    : Json("{\"message\":\"Forbidden\"}", HttpStatusCode.Forbidden);
+            });
+            using AtlassianHttpClient http = Client(handler);
+            await ThrowsAsync<AtlassianApiException>(() => new JiraClient(http).SprintsAsync("DRB", null, new PageRequest(Limit: 1), default));
+            Equal(3, handler.Requests.Count);
+        }
+        );
+        yield return ("Jira project list uses array endpoint and applies pagination locally", async () =>
+        {
+            var handler = new FakeHandler(request =>
+            {
+                Equal("/confluence/rest/api/2/project", request.Uri.AbsolutePath);
+                True(string.IsNullOrEmpty(request.Uri.Query));
+                return Json("[{\"key\":\"ONE\",\"name\":\"One\"},{\"key\":\"TWO\",\"name\":\"Two\"},{\"key\":\"THREE\",\"name\":\"Three\"}]");
+            });
+            using AtlassianHttpClient http = Client(handler);
+            var client = new JiraClient(http);
+            ListResult result = await client.ProjectsAsync(new PageRequest(Start: 1, Limit: 1), default);
+            Equal(1, result.Size);
+            Equal("TWO", JsonValues.Text(result.Results[0], "key"));
+            Equal(3, result.Total);
+            True(result.HasMore);
+            result = await client.ProjectsAsync(new PageRequest(Start: 1, All: true), default);
+            Equal(2, result.Size);
+            Equal("THREE", JsonValues.Text(result.Results[1], "key"));
+            True(!result.HasMore);
+            Equal(2, handler.Requests.Count);
+        }
+        );
         yield return ("Jira pagination uses returned count and exact limit", async () =>
         {
             var handler = new FakeHandler(request =>

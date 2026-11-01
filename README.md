@@ -198,6 +198,44 @@ atlassian-cli jira issue comment list PROJ-123 --all
 Also available: subtasks, transitions and browser opening. Use
 `jira issue open PROJ-123 --url-only` to get the link without a browser handler.
 
+### List Jira sprints for a project
+
+```bash
+atlassian-cli jira sprint list --project PROJ
+atlassian-cli jira sprint list --project PROJ --state active,future --all
+atlassian-cli jira sprint list --project PROJ --all -o json
+```
+
+Requires Jira Software. Sprints are collected from all visible Scrum boards
+associated with the project, deduplicated and sorted by descending sprint ID
+(highest ID first, not by start date). All states
+are included by default; `--state` accepts `active`, `future`, `closed` or a
+comma-separated combination. Pagination applies to the combined list, after
+fetching all matching sprints. Boards may include other projects, so this is not
+an issue-level project filter.
+
+List tickets using a sprint ID from `sprint list` (not a board ID):
+
+```bash
+atlassian-cli jira sprint issues --sprint 123 --all
+atlassian-cli jira sprint issues --sprint 123 --all -o json
+atlassian-cli jira sprint issues --sprint 123 --all --include-body
+atlassian-cli jira sprint issues --sprint 123 --status '+In Progress' --status='-Done' --all
+atlassian-cli jira sprint issues --sprint 123 --status='-Done,Ready,ReadyForTest' --all
+```
+
+This returns visible sprint issues across projects in Jira's returned order,
+with the same pagination options as `jira issue search`. By default only overview
+fields are requested and descriptions are omitted. Add `--include-body` to fetch
+all issue fields and display descriptions. JSON contains the requested fields;
+use `jira issue get KEY` for an individual issue's full details.
+Repeat `--status 'NAME'` or `--status '+NAME'` to include ticket statuses, or
+`--status='-NAME'` to exclude them. Multiple names can be comma-separated;
+`+` is optional and commas cannot be part of a name.
+Multiple inclusions are alternatives; exclusions are applied as
+well. With only exclusions, every other status remains. Status filtering happens
+on Jira before pagination and can be combined with `--include-body`.
+
 See the [complete command reference](docs/COMMANDS.md), or append `--help` to any
 command for its arguments and options.
 
@@ -205,7 +243,7 @@ command for its arguments and options.
 
 | Option | Best for |
 |---|---|
-| `-o table` | Scanning results in the terminal; default |
+| `-o table` | Scanning aligned, Unicode-aware columns in a bordered terminal table; default |
 | `-o json` | Scripts and original resource data, including custom fields |
 | `-o markdown` | Reading content and sharing human-readable output |
 

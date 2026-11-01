@@ -244,6 +244,45 @@ public sealed class CliApplication
             using AtlassianHttpClient http = Http(parse, "JIRA");
             await Writer(parse).WriteAsync(await new JiraClient(http).MyselfAsync(ct), OutputKind.JiraUser, ct);
         });
+        Command jiraProject = Child(jira, "project", "Read Jira projects");
+        Command projectList = Child(jiraProject, "list", "List visible projects");
+        var projectPage = new Pagination(projectList);
+        Action(projectList, async (parse, ct) =>
+        {
+            PageRequest page = projectPage.Read(parse);
+            using AtlassianHttpClient http = Http(parse, "JIRA");
+            await Writer(parse).WriteAsync(await new JiraClient(http).ProjectsAsync(page, ct), OutputKind.JiraProject, ct);
+        });
+        Command sprint = Child(jira, "sprint", "Read Jira Software sprints");
+        Command sprintList = Child(sprint, "list", "List unique sprints from all visible Scrum boards associated with a project");
+        Option<string> sprintProject = Option<string>(sprintList, "--project", "Project key or ID", true);
+        Option<string?> sprintState = Option<string?>(sprintList, "--state", "Filter by active, future or closed; comma-separated; defaults to all states");
+        var sprintPage = new Pagination(sprintList);
+        Action(sprintList, async (parse, ct) =>
+        {
+            string projectKey = Required(parse.GetValue(sprintProject), "--project");
+            PageRequest page = sprintPage.Read(parse);
+            using AtlassianHttpClient http = Http(parse, "JIRA");
+            await Writer(parse).WriteAsync(
+                await new JiraClient(http).SprintsAsync(projectKey, parse.GetValue(sprintState), page, ct),
+                OutputKind.JiraSprint, ct);
+        });
+        Command sprintIssues = Child(sprint, "issues", "List visible issues in a sprint");
+        Option<int> sprintId = Option<int>(sprintIssues, "--sprint", "Positive numeric sprint ID (not a board ID)", true);
+        Option<bool> sprintIssuesBody = Option<bool>(sprintIssues, "--include-body", "Retrieve all issue fields and display descriptions; disabled by default");
+        Option<string[]> sprintIssuesStatus = Option<string[]>(sprintIssues, "--status", "Comma-separated NAME/+NAME to include or -NAME to exclude; repeatable; e.g. --status='-Done,Ready,ReadyForTest'");
+        sprintIssuesStatus.AllowMultipleArgumentsPerToken = false;
+        sprintIssuesStatus.Arity = ArgumentArity.OneOrMore;
+        var sprintIssuesPage = new Pagination(sprintIssues);
+        Action(sprintIssues, async (parse, ct) =>
+        {
+            PageRequest page = sprintIssuesPage.Read(parse);
+            bool includeBody = parse.GetValue(sprintIssuesBody);
+            using AtlassianHttpClient http = Http(parse, "JIRA");
+            await Writer(parse).WriteAsync(
+                await new JiraClient(http).SprintIssuesAsync(parse.GetValue(sprintId), page, ct, includeBody, parse.GetValue(sprintIssuesStatus)),
+                OutputKind.JiraIssue, ct, includeBody);
+        });
         Command issue = Child(jira, "issue", "Read and manage issues");
         Command get = Child(issue, "get", "Get an issue with original fields");
         Argument<string> getKey = Argument(get, "key");

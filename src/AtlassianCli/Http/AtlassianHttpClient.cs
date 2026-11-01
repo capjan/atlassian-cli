@@ -77,6 +77,9 @@ public sealed class AtlassianHttpClient : IDisposable
     public Task<JsonElement> GetAsync(string path, IEnumerable<KeyValuePair<string, string>>? query, CancellationToken cancellationToken)
         => GetAsync(ApiUri(path, query), cancellationToken);
 
+    public Task<JsonElement> GetArrayAsync(string path, CancellationToken cancellationToken)
+        => SendAsync(HttpMethod.Get, ApiUri(path), null, true, cancellationToken, JsonValueKind.Array);
+
     public Task<JsonElement> GetAsync(Uri uri, CancellationToken cancellationToken)
         => SendAsync(HttpMethod.Get, uri, null, true, cancellationToken);
 
@@ -86,7 +89,13 @@ public sealed class AtlassianHttpClient : IDisposable
     public Task<JsonElement> WriteAsync(HttpMethod method, string path, IEnumerable<KeyValuePair<string, string>> query, JsonNode? body, CancellationToken cancellationToken)
         => SendAsync(method, ApiUri(path, query), body, false, cancellationToken);
 
-    private async Task<JsonElement> SendAsync(HttpMethod method, Uri uri, JsonNode? body, bool expectJson, CancellationToken cancellationToken)
+    private async Task<JsonElement> SendAsync(
+        HttpMethod method,
+        Uri uri,
+        JsonNode? body,
+        bool expectJson,
+        CancellationToken cancellationToken,
+        JsonValueKind expectedRoot = JsonValueKind.Object)
     {
         ValidateUri(uri);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -117,9 +126,9 @@ public sealed class AtlassianHttpClient : IDisposable
 
             byte[] bytes = await ReadBoundedAsync(response.Content, MaximumJsonBytes, timeout.Token);
             using JsonDocument document = JsonDocument.Parse(bytes);
-            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            if (document.RootElement.ValueKind != expectedRoot)
             {
-                throw new InvalidDataException("Expected a JSON object from the Atlassian API.");
+                throw new InvalidDataException($"Expected a JSON {expectedRoot.ToString().ToLowerInvariant()} from the Atlassian API.");
             }
 
             return document.RootElement.Clone();
